@@ -236,7 +236,7 @@ class TextEncoderLoader(ComponentLoader):
 
             weights_to_load = {name for name, _ in model.named_parameters()}
             loaded_weights = model.load_weights(
-                self._get_all_weights(model, model_path, to_cpu=should_offload)
+                self._get_all_weights(model, model_path, to_cpu=True)
             )
 
             # Explicitly move model to target device after loading weights
