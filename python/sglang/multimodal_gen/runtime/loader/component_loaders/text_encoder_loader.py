@@ -236,6 +236,7 @@ class TextEncoderLoader(ComponentLoader):
 
             weights_to_load = {name for name, _ in model.named_parameters()}
             loaded_weights = model.load_weights(
+                # Always load to CPU first to avoid a redundant D2D copy.
                 self._get_all_weights(model, model_path, to_cpu=True)
             )
 
