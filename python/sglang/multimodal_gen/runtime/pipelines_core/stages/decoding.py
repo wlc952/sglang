@@ -61,6 +61,13 @@ class DecodingStage(PipelineStage):
         self.vae: ParallelTiledVAE = vae
         self.pipeline = weakref.ref(pipeline) if pipeline else None
 
+        # Register layerwise NVTX hooks for profiling
+        import torch.nn as nn
+        from sglang.srt.utils.nvtx_pytorch_hooks import PytHooks
+        if isinstance(self.vae, nn.Module):
+            _pyt_hooks = PytHooks()
+            _pyt_hooks.register_hooks(self.vae, module_prefix="vae")
+
     @property
     def parallelism_type(self) -> StageParallelismType:
         if get_global_server_args().enable_cfg_parallel:

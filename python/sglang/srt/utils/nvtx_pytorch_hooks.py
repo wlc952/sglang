@@ -288,5 +288,6 @@ class PytHooks(object):
             if module not in self.module_to_name_map:
                 self.module_to_name_map[module] = name
             else:
-                raise ValueError("Module instance {} is not unique ".format(module))
+                # raise ValueError("Module instance {} is not unique ".format(module))
+                continue
         return

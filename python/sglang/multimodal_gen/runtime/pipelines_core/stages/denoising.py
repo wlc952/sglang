@@ -129,6 +129,18 @@ class DenoisingStage(PipelineStage):
         self._cached_num_steps = None
         self._is_warmed_up = False
 
+        # Register layerwise NVTX hooks for profiling
+        from sglang.srt.utils.nvtx_pytorch_hooks import PytHooks
+        _pyt_hooks = PytHooks()
+        for _t, _prefix in filter(
+            lambda x: x[0] is not None and isinstance(x[0], nn.Module),
+            [
+                (self.transformer, "transformer"),
+                (self.transformer_2, "transformer_2"),
+            ],
+        ):
+            _pyt_hooks.register_hooks(_t, module_prefix=_prefix)
+
     def _maybe_enable_torch_compile(self, module: object) -> None:
         """
         Compile a module with torch.compile, and enable inductor overlap tweak if available.

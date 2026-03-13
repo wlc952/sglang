@@ -16,6 +16,7 @@ from typing import Any
 import numpy as np
 import requests
 import torch
+import torch.nn as nn
 import torchvision.transforms as T
 from diffusers import DiffusionPipeline
 from PIL import Image
@@ -47,6 +48,48 @@ class DiffusersExecutionStage(PipelineStage):
     def __init__(self, diffusers_pipe: DiffusionPipeline):
         super().__init__()
         self.diffusers_pipe = diffusers_pipe
+        self._nvtx_pyt_hooks = []
+        self._register_layerwise_nvtx_hooks()
+
+    def _register_layerwise_nvtx_hooks(self) -> None:
+        """Register layerwise NVTX hooks for core diffusers components."""
+        from sglang.srt.utils.nvtx_pytorch_hooks import PytHooks
+
+        hook_targets = [
+            ("text_encoder", getattr(self.diffusers_pipe, "text_encoder", None)),
+            (
+                "text_encoder_2",
+                getattr(self.diffusers_pipe, "text_encoder_2", None),
+            ),
+            ("unet", getattr(self.diffusers_pipe, "unet", None)),
+            ("transformer", getattr(self.diffusers_pipe, "transformer", None)),
+            ("vae", getattr(self.diffusers_pipe, "vae", None)),
+        ]
+
+        registered_components = []
+        for component_name, component_module in hook_targets:
+            if component_module is None or not isinstance(component_module, nn.Module):
+                continue
+
+            pyt_hooks = PytHooks()
+            try:
+                pyt_hooks.register_hooks(component_module, module_prefix=component_name)
+            except ValueError as e:
+                logger.warning(
+                    "Skip NVTX hooks for diffusers component '%s': %s",
+                    component_name,
+                    e,
+                )
+                continue
+
+            self._nvtx_pyt_hooks.append(pyt_hooks)
+            registered_components.append(component_name)
+
+        if registered_components:
+            logger.info(
+                "Registered layerwise NVTX hooks for diffusers components: %s",
+                ", ".join(registered_components),
+            )
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         """Execute the diffusers pipeline."""

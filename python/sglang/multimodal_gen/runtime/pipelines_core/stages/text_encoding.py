@@ -45,6 +45,14 @@ class TextEncodingStage(PipelineStage):
         self.tokenizers = tokenizers
         self.text_encoders = text_encoders
 
+        # Register layerwise NVTX hooks for profiling
+        import torch.nn as nn
+        from sglang.srt.utils.nvtx_pytorch_hooks import PytHooks
+        _pyt_hooks = PytHooks()
+        for i, encoder in enumerate(self.text_encoders):
+            if isinstance(encoder, nn.Module):
+                _pyt_hooks.register_hooks(encoder, module_prefix=f"text_encoder_{i}")
+
     @torch.no_grad()
     def forward(
         self,
