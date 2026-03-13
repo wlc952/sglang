@@ -351,6 +351,7 @@ class ComposedPipelineBase(ABC):
         if stage_name in self._stage_name_mapping:
             raise ValueError(f"Duplicate stage name detected: {stage_name}")
 
+        setattr(stage, "stage_dump_name", stage_name)
         self._stages.append(stage)
         self._stage_name_mapping[stage_name] = stage
         return self

@@ -40,6 +40,7 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_sp_parallel_rank,
     get_sp_world_size,
     get_tp_group,
+    get_world_rank,
     get_world_group,
     get_world_size,
 )
@@ -63,6 +64,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
     StageParallelismType,
+    _build_stage_dump_dir,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     StageValidators as V,
@@ -82,6 +84,33 @@ from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
 from sglang.multimodal_gen.utils import dict_to_3d_list, masks_like
 
 logger = init_logger(__name__)
+
+
+def _dump_denoising_step_tensor(
+    batch: Req,
+    step_index: int,
+    tensor_name: str,
+    tensor_value: torch.Tensor,
+) -> None:
+    if batch.is_warmup or not getattr(batch, "save_output", False):
+        return
+    if get_world_rank() != 0:
+        return
+
+    dump_dir = os.path.join(_build_stage_dump_dir(batch), "denoising_step_dumps")
+    os.makedirs(dump_dir, exist_ok=True)
+    timesteps = getattr(batch, "timesteps", None)
+
+    dump_payload = {
+        "request_id": getattr(batch, "request_id", None),
+        "step_index": step_index,
+        "tensor_name": tensor_name,
+        "timestep": timesteps[step_index].detach().cpu() if timesteps is not None else None,
+        "value": tensor_value.detach().cpu().contiguous(),
+    }
+
+    dump_file_path = os.path.join(dump_dir, f"{step_index:02d}_{tensor_name}.pt")
+    torch.save(dump_payload, dump_file_path)
 
 
 class DenoisingStage(PipelineStage):
@@ -1031,6 +1060,8 @@ class DenoisingStage(PipelineStage):
                             )
                         )
 
+                        _dump_denoising_step_tensor(batch, i, "latents_in", latents)
+
                         # Expand latents for I2V
                         latent_model_input = latents.to(target_dtype)
                         if batch.image_latent is not None:
@@ -1053,6 +1084,13 @@ class DenoisingStage(PipelineStage):
 
                         latent_model_input = self.scheduler.scale_model_input(
                             latent_model_input, t_device
+                        )
+
+                        _dump_denoising_step_tensor(
+                            batch,
+                            i,
+                            "latent_model_input",
+                            latent_model_input,
                         )
 
                         # Predict noise residual
@@ -1080,6 +1118,8 @@ class DenoisingStage(PipelineStage):
                             latents=latents,
                         )
 
+                        _dump_denoising_step_tensor(batch, i, "noise_pred", noise_pred)
+
                         # Save noise_pred to batch for external access (e.g., ComfyUI)
                         if server_args.comfyui_mode:
                             batch.noise_pred = noise_pred
@@ -1092,6 +1132,8 @@ class DenoisingStage(PipelineStage):
                             **extra_step_kwargs,
                             return_dict=False,
                         )[0]
+
+                        _dump_denoising_step_tensor(batch, i, "latents_out", latents)
 
                         latents = self.post_forward_for_ti2v_task(
                             batch, server_args, reserved_frames_mask, latents, z
@@ -1412,6 +1454,12 @@ class DenoisingStage(PipelineStage):
                 noise_pred_cond = server_args.pipeline_config.slice_noise_pred(
                     noise_pred_cond, latents
                 )
+                _dump_denoising_step_tensor(
+                    batch,
+                    timestep_index,
+                    "noise_pred_cond",
+                    noise_pred_cond,
+                )
         if not batch.do_classifier_free_guidance:
             # If CFG is disabled, we are done. Return the conditional prediction.
             return noise_pred_cond
@@ -1435,6 +1483,12 @@ class DenoisingStage(PipelineStage):
                 )
                 noise_pred_uncond = server_args.pipeline_config.slice_noise_pred(
                     noise_pred_uncond, latents
+                )
+                _dump_denoising_step_tensor(
+                    batch,
+                    timestep_index,
+                    "noise_pred_uncond",
+                    noise_pred_uncond,
                 )
 
         # Combine predictions

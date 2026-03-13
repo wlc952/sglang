@@ -10,9 +10,12 @@ composed to create complete diffusion pipelines.
 
 from abc import ABC, abstractmethod
 from enum import Enum, auto
+import os
 
 import torch
 
+from sglang.multimodal_gen.runtime.distributed import get_world_rank
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
@@ -23,6 +26,123 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
 
 logger = init_logger(__name__)
+
+_REQ_DUMP_FIELDS = {
+    "image_embeds",
+    "prompt_embeds",
+    "negative_prompt_embeds",
+    "prompt_attention_mask",
+    "negative_attention_mask",
+    "clip_embedding_pos",
+    "clip_embedding_neg",
+    "pooled_embeds",
+    "neg_pooled_embeds",
+    "audio_prompt_embeds",
+    "negative_audio_prompt_embeds",
+    "latents",
+    "y",
+    "latent_ids",
+    "audio_latents",
+    "audio_noise",
+    "raw_audio_latent_shape",
+    "raw_latent_shape",
+    "noise_pred",
+    "image_latent",
+    "condition_image_latent_ids",
+    "timesteps",
+    "paired_timesteps",
+    "timestep",
+    "trajectory_timesteps",
+    "trajectory_latents",
+    "trajectory_audio_latents",
+    "output",
+    "audio",
+}
+
+_OUTPUT_BATCH_DUMP_FIELDS = {
+    "output",
+    "audio",
+    "trajectory_timesteps",
+    "trajectory_latents",
+    "trajectory_decoded",
+    "noise_pred",
+}
+
+
+def _serialize_dump_value(value):
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().contiguous()
+    if isinstance(value, dict):
+        serialized = {
+            key: _serialize_dump_value(sub_value)
+            for key, sub_value in value.items()
+        }
+        return {
+            key: sub_value
+            for key, sub_value in serialized.items()
+            if sub_value is not None
+        }
+    if isinstance(value, (list, tuple)):
+        serialized = [_serialize_dump_value(item) for item in value]
+        serialized = [item for item in serialized if item is not None]
+        return serialized if serialized else None
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return None
+
+
+def _collect_dumpable_state(obj):
+    if obj is None:
+        return {}
+
+    state = {}
+    dataclass_fields = getattr(obj.__class__, "__dataclass_fields__", {})
+    if isinstance(obj, OutputBatch):
+        selected_fields = _OUTPUT_BATCH_DUMP_FIELDS
+    else:
+        selected_fields = _REQ_DUMP_FIELDS
+
+    for field_name in dataclass_fields:
+        if field_name not in selected_fields:
+            continue
+        serialized = _serialize_dump_value(getattr(obj, field_name, None))
+        if serialized is not None:
+            state[field_name] = serialized
+
+    return state
+
+
+def _build_stage_dump_dir(batch: Req) -> str:
+    output_file_path = batch.output_file_path() if batch.output_file_path() else None
+    if output_file_path is not None:
+        return f"{output_file_path}.stage_dumps"
+
+    output_root = getattr(batch, "output_path", None) or "outputs"
+    request_id = getattr(batch, "request_id", "unknown_request")
+    return os.path.join(output_root, f"{request_id}.stage_dumps")
+
+
+def _dump_stage_result(batch: Req, result: Req | OutputBatch, stage_name: str) -> None:
+    if batch.is_warmup or not getattr(batch, "save_output", False):
+        return
+    if get_world_rank() != 0:
+        return
+
+    stage_index = batch.extra.get("_stage_dump_index", 0)
+    batch.extra["_stage_dump_index"] = stage_index + 1
+
+    dump_dir = _build_stage_dump_dir(batch)
+    os.makedirs(dump_dir, exist_ok=True)
+
+    dump_payload = {
+        "request_id": getattr(batch, "request_id", None),
+        "stage_index": stage_index,
+        "stage_name": stage_name,
+        "state": _collect_dumpable_state(result),
+    }
+
+    dump_file_path = os.path.join(dump_dir, f"{stage_index:02d}_{stage_name}.pt")
+    torch.save(dump_payload, dump_file_path)
 
 
 class StageParallelismType(Enum):
@@ -209,6 +329,12 @@ class PipelineStage(ABC):
         except Exception as e:
             logger.error("Output verification failed for %s: %s", stage_name, str(e))
             raise
+
+        _dump_stage_result(
+            batch,
+            result,
+            getattr(self, "stage_dump_name", stage_name),
+        )
 
         return result
 

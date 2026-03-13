@@ -8,6 +8,7 @@ through sglang's infrastructure using vanilla diffusers pipelines.
 
 import argparse
 import inspect
+import os
 import re
 import warnings
 from io import BytesIO
@@ -33,6 +34,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.executors.sync_executor import
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages import PipelineStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
+    _build_stage_dump_dir,
+    _serialize_dump_value,
+)
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_model
@@ -52,6 +57,7 @@ class DiffusersExecutionStage(PipelineStage):
         """Execute the diffusers pipeline."""
 
         kwargs = self._build_pipeline_kwargs(batch, server_args)
+        self._attach_step_dump_callback(kwargs, batch)
 
         # Filter kwargs to only those supported by the pipeline, warn about ignored args
         kwargs, _ = self._filter_pipeline_kwargs(kwargs)
@@ -77,6 +83,74 @@ class DiffusersExecutionStage(PipelineStage):
             batch.output = self._postprocess_output(batch.output)
 
         return batch
+
+    def _attach_step_dump_callback(self, kwargs: dict[str, Any], batch: Req) -> None:
+        """Attach a diffusers step callback to dump per-step intermediate tensors."""
+        if batch.is_warmup or not getattr(batch, "save_output", False):
+            return
+
+        dump_dir = os.path.join(_build_stage_dump_dir(batch), "diffusers_step_dumps")
+        os.makedirs(dump_dir, exist_ok=True)
+
+        def _step_dump_callback(*cb_args, **cb_kwargs):
+            step_index = -1
+            timestep = None
+            callback_payload = None
+
+            # Common diffusers signature: (pipeline, step_index, timestep, callback_kwargs)
+            if len(cb_args) >= 4 and isinstance(cb_args[1], int):
+                step_index = cb_args[1]
+                timestep = cb_args[2]
+                callback_payload = cb_args[3]
+            elif len(cb_args) >= 3 and isinstance(cb_args[0], int):
+                # Fallback variant: (step_index, timestep, callback_kwargs)
+                step_index = cb_args[0]
+                timestep = cb_args[1]
+                callback_payload = cb_args[2]
+
+            if not isinstance(callback_payload, dict):
+                callback_payload = cb_kwargs.get("callback_kwargs", {})
+
+            if not isinstance(callback_payload, dict):
+                callback_payload = {}
+
+            state = {}
+            for key, value in callback_payload.items():
+                serialized = _serialize_dump_value(value)
+                if serialized is not None:
+                    state[key] = serialized
+
+            dump_payload = {
+                "request_id": getattr(batch, "request_id", None),
+                "step_index": step_index,
+                "timestep": _serialize_dump_value(timestep),
+                "state": state,
+            }
+            dump_file_path = os.path.join(dump_dir, f"{step_index:02d}_step.pt")
+            torch.save(dump_payload, dump_file_path)
+
+            return callback_payload
+
+        kwargs["callback_on_step_end"] = _step_dump_callback
+        preferred_inputs = [
+            "latents",
+            "prompt_embeds",
+            "negative_prompt_embeds",
+            "add_text_embeds",
+            "negative_pooled_prompt_embeds",
+            "add_time_ids",
+        ]
+        allowed_inputs = getattr(self.diffusers_pipe, "_callback_tensor_inputs", None)
+        if isinstance(allowed_inputs, (list, tuple, set)):
+            filtered_inputs = [k for k in preferred_inputs if k in allowed_inputs]
+        else:
+            filtered_inputs = preferred_inputs
+
+        # Ensure there is always at least one valid tensor input for step callbacks.
+        if not filtered_inputs:
+            filtered_inputs = ["latents"]
+
+        kwargs.setdefault("callback_on_step_end_tensor_inputs", filtered_inputs)
 
     def _filter_pipeline_kwargs(
         self, kwargs: dict, *, strict: bool = False
@@ -623,6 +697,7 @@ class DiffusersPipeline(ComposedPipelineBase):
         if stage_name in self._stage_name_mapping:
             raise ValueError(f"Duplicate stage name detected: {stage_name}")
 
+        setattr(stage, "stage_dump_name", stage_name)
         self._stages.append(stage)
         self._stage_name_mapping[stage_name] = stage
         return self
