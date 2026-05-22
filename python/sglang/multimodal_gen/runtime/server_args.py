@@ -674,6 +674,7 @@ class ServerArgs(DisaggArgsMixin):
                 "Warmup is disabled because tensor dump mode is enabled."
             )
             self.warmup = False
+            return
 
         if self.warmup_resolutions is not None:
             self.warmup = True
