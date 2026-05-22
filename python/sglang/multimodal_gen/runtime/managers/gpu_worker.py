@@ -67,6 +67,7 @@ from sglang.multimodal_gen.runtime.utils.perf_logger import (
 from sglang.multimodal_gen.runtime.utils.trace_wrapper import DiffStage, trace_slice
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.utils.network import NetworkAddress
+from sglang.srt.utils.nvtx_pytorch_hooks import PytHooks
 
 logger = init_logger(__name__)
 
@@ -162,6 +163,80 @@ class GPUWorker:
             setproctitle(f"sgl_diffusion::scheduler_{self.local_rank}")
 
         self.pipeline = build_pipeline(self.server_args)
+
+        # Register layerwise NVTX profiling hooks if enabled
+        if self.server_args.enable_layerwise_nvtx_marker:
+            pyt_hooks = PytHooks()
+            for module_name, module in self.pipeline.modules.items():
+                if isinstance(module, torch.nn.Module):
+                    pyt_hooks.register_hooks(module, module_prefix=module_name)
+
+        # Register tensor dump hooks if enabled
+        if self.server_args.debug_tensor_dump_output_folder:
+            from dataclasses import fields as dc_fields
+            from dataclasses import is_dataclass
+
+            from sglang.srt.debug_utils.tensor_dump_forward_hook import TensorDumper
+
+            class DiffusionTensorDumper(TensorDumper):
+                """Extends TensorDumper to handle diffusion-specific output types."""
+
+                def add_tensor(self, name, tensor_item):
+                    if is_dataclass(tensor_item) and not isinstance(
+                        tensor_item, type
+                    ):
+                        for f in dc_fields(tensor_item):
+                            val = getattr(tensor_item, f.name)
+                            if isinstance(val, torch.Tensor):
+                                self._current_tensors[f"{name}.{f.name}"] = val.cpu()
+                            elif isinstance(val, (tuple, list)):
+                                tensors = [
+                                    t.cpu() for t in val if isinstance(t, torch.Tensor)
+                                ]
+                                if len(tensors) == 1:
+                                    self._current_tensors[f"{name}.{f.name}"] = (
+                                        tensors[0]
+                                    )
+                                elif tensors:
+                                    self._current_tensors[f"{name}.{f.name}"] = tensors
+                    else:
+                        super().add_tensor(name, tensor_item)
+
+            tp_rank = get_tp_rank() if model_parallel_is_initialized() else 0
+            tp_size = get_tp_world_size() if model_parallel_is_initialized() else 1
+
+            self._tensor_dumper = DiffusionTensorDumper(
+                dump_dir=self.server_args.debug_tensor_dump_output_folder,
+                dump_layers=None,
+                tp_size=tp_size,
+                tp_rank=tp_rank,
+                pp_rank=0,
+            )
+            for module_name, module in self.pipeline.modules.items():
+                if isinstance(module, torch.nn.Module):
+                    self._tensor_dumper._add_hook_recursive(
+                        module, module_name, module_name, "layers"
+                    )
+                    module.register_forward_hook(
+                        self._tensor_dumper._dump_hook(module_name, True)
+                    )
+
+            # VAE uses .decode() instead of forward(), so forward hooks won't
+            # fire. Wrap .decode() to capture its input/output.
+            vae = self.pipeline.get_module("vae", None)
+            if vae is not None and hasattr(vae, "decode"):
+                dumper = self._tensor_dumper
+                _orig_decode = vae.decode
+
+                def _wrapped_decode(*args, **kwargs):
+                    result = _orig_decode(*args, **kwargs)
+                    if args:
+                        dumper.add_tensor("vae.decode.input", args[0])
+                    dumper.add_tensor("vae.decode.output", result)
+                    dumper.dump_current_tensors()
+                    return result
+
+                vae.decode = _wrapped_decode
 
         # apply layerwise offload after lora is applied while building LoRAPipeline
         # otherwise empty offloaded weights could fail lora converting
