@@ -164,12 +164,18 @@ class GPUWorker:
 
         self.pipeline = build_pipeline(self.server_args)
 
-        # Register layerwise NVTX profiling hooks if enabled
+        # Register layerwise NVTX profiling hooks if enabled.
+        # Retain the hooks manager on `self` so the worker can avoid
+        # duplicate registration across repeated initializations and
+        # optionally manage the hooks later.
         if self.server_args.enable_layerwise_nvtx_marker:
-            pyt_hooks = PytHooks()
-            for module_name, module in self.pipeline.modules.items():
-                if isinstance(module, torch.nn.Module):
-                    pyt_hooks.register_hooks(module, module_prefix=module_name)
+            if getattr(self, "_nvtx_hooks", None) is None:
+                self._nvtx_hooks = PytHooks()
+                for module_name, module in self.pipeline.modules.items():
+                    if isinstance(module, torch.nn.Module):
+                        self._nvtx_hooks.register_hooks(
+                            module, module_prefix=module_name
+                        )
 
         # Register tensor dump hooks if enabled
         if self.server_args.debug_tensor_dump_output_folder:
