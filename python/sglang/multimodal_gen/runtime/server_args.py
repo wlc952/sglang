@@ -313,6 +313,9 @@ class ServerArgs(DisaggArgsMixin):
     enable_trace: bool = False
     otlp_traces_endpoint: str = "localhost:4317"
 
+    # NVTX profiling
+    enable_layerwise_nvtx_marker: bool = False
+
     # Debug tensor dump
     debug_tensor_dump_output_folder: Optional[str] = None
 
@@ -1485,6 +1488,12 @@ class ServerArgs(DisaggArgsMixin):
             type=str,
             default=ServerArgs.otlp_traces_endpoint,
             help="OTLP collector endpoint when --enable-trace is set. Format: <host>:<port>",
+        )
+        parser.add_argument(
+            "--enable-layerwise-nvtx-marker",
+            action="store_true",
+            default=ServerArgs.enable_layerwise_nvtx_marker,
+            help="Enable layerwise NVTX profiling annotations for the model.",
         )
         parser.add_argument(
             "--uvicorn-access-log-exclude-prefixes",

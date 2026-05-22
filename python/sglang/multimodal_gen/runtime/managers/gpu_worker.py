@@ -67,6 +67,7 @@ from sglang.multimodal_gen.runtime.utils.perf_logger import (
 from sglang.multimodal_gen.runtime.utils.trace_wrapper import DiffStage, trace_slice
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.utils.network import NetworkAddress
+from sglang.srt.utils.nvtx_pytorch_hooks import PytHooks
 
 logger = init_logger(__name__)
 
@@ -162,6 +163,13 @@ class GPUWorker:
             setproctitle(f"sgl_diffusion::scheduler_{self.local_rank}")
 
         self.pipeline = build_pipeline(self.server_args)
+
+        # Register layerwise NVTX profiling hooks if enabled
+        if self.server_args.enable_layerwise_nvtx_marker:
+            pyt_hooks = PytHooks()
+            for module_name, module in self.pipeline.modules.items():
+                if isinstance(module, torch.nn.Module):
+                    pyt_hooks.register_hooks(module, module_prefix=module_name)
 
         # Register tensor dump hooks if enabled
         if self.server_args.debug_tensor_dump_output_folder:
