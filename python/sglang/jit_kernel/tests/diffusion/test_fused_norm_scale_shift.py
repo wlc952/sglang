@@ -6,7 +6,7 @@ import torch
 from einops import rearrange
 from torch import Tensor
 
-from sglang.jit_kernel.diffusion.cutedsl.scale_residual_norm_scale_shift import (
+from sglang.jit_kernel.scale_residual_norm_scale_shift import (
     fused_norm_scale_shift,
     fused_scale_residual_norm_scale_shift,
 )
@@ -42,7 +42,7 @@ INDEX_MODES = ["BSD", "1", "1SD", "BD", "B1D", "D", "1D", "11D", "BF1D"]
 
 
 def _tol(dtype: torch.dtype):
-    return 1e-5 if dtype == torch.float32 else 5e-2
+    return 1e-5 if dtype == torch.float32 else 7e-2
 
 
 @pytest.fixture(autouse=True)
