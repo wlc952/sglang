@@ -179,70 +179,105 @@ class GPUWorker:
 
         # Register tensor dump hooks if enabled
         if self.server_args.debug_tensor_dump_output_folder:
-            from dataclasses import fields as dc_fields
-            from dataclasses import is_dataclass
+            import dataclasses
+            from pathlib import Path
 
-            from sglang.srt.debug_utils.tensor_dump_forward_hook import TensorDumper
+            class DiffusionTensorDumper:
+                """Hooks leaf modules and accumulates all tensors into a single .pt file."""
 
-            class DiffusionTensorDumper(TensorDumper):
-                """Extends TensorDumper to handle diffusion-specific output types."""
+                def __init__(self, dump_dir, rank, local_rank):
+                    self._pid = os.getpid()
+                    self._tensors = {}
+                    self._handles = []
+                    self._pass_id = 0
+                    self._process_dir = (
+                        Path(dump_dir)
+                        / f"Rank{rank}_LocalRank{local_rank}_pid{self._pid}"
+                    )
+                    self._process_dir.mkdir(parents=True, exist_ok=True)
 
-                def add_tensor(self, name, tensor_item):
-                    if is_dataclass(tensor_item) and not isinstance(
-                        tensor_item, type
+                def _add_tensor_recursive(self, name, value):
+                    if isinstance(value, torch.Tensor):
+                        self._tensors[name] = value.detach().cpu()
+                    elif isinstance(value, (tuple, list)):
+                        for i, item in enumerate(value):
+                            self._add_tensor_recursive(f"{name}.{i}", item)
+                    elif isinstance(value, dict):
+                        for key, item in value.items():
+                            self._add_tensor_recursive(f"{name}.{key}", item)
+                    elif dataclasses.is_dataclass(value) and not isinstance(
+                        value, type
                     ):
-                        for f in dc_fields(tensor_item):
-                            val = getattr(tensor_item, f.name)
-                            if isinstance(val, torch.Tensor):
-                                self._current_tensors[f"{name}.{f.name}"] = val.cpu()
-                            elif isinstance(val, (tuple, list)):
-                                tensors = [
-                                    t.cpu() for t in val if isinstance(t, torch.Tensor)
-                                ]
-                                if len(tensors) == 1:
-                                    self._current_tensors[f"{name}.{f.name}"] = (
-                                        tensors[0]
-                                    )
-                                elif tensors:
-                                    self._current_tensors[f"{name}.{f.name}"] = tensors
-                    else:
-                        super().add_tensor(name, tensor_item)
+                        for f in dataclasses.fields(value):
+                            self._add_tensor_recursive(
+                                f"{name}.{f.name}", getattr(value, f.name)
+                            )
+
+                def _make_hook(self, tensor_name):
+                    def hook(module, input, output):
+                        if output is not None:
+                            self._add_tensor_recursive(tensor_name, output)
+
+                    return hook
+
+                def register_pipeline(self, pipeline):
+                    seen_ids = set()
+                    for module_name, module in pipeline.modules.items():
+                        if not isinstance(module, torch.nn.Module):
+                            continue
+                        for name, submodule in self._iter_leaf_modules(
+                            module_name, module
+                        ):
+                            mid = id(submodule)
+                            if mid in seen_ids:
+                                continue
+                            seen_ids.add(mid)
+                            self._handles.append(
+                                submodule.register_forward_hook(
+                                    self._make_hook(name)
+                                )
+                            )
+                    logger.info(
+                        "Registered diffusion tensor dump hooks. "
+                        "Output folder: %s",
+                        self._process_dir,
+                    )
+
+                @staticmethod
+                def _iter_leaf_modules(component_name, module):
+                    children = list(module.named_children())
+                    if len(children) == 0:
+                        yield component_name, module
+                        return
+                    for name, submodule in module.named_modules():
+                        if name == "":
+                            continue
+                        if len(list(submodule.children())) == 0:
+                            yield f"{component_name}.{name}", submodule
+
+                def flush(self):
+                    if not self._tensors:
+                        return
+                    out_file = self._process_dir / f"Pass{self._pass_id:05d}.pt"
+                    logger.info(
+                        "Dump %d tensors to %s", len(self._tensors), out_file
+                    )
+                    torch.save(self._tensors, str(out_file))
+                    self._tensors = {}
+                    self._pass_id += 1
 
             tp_rank = get_tp_rank() if model_parallel_is_initialized() else 0
-            tp_size = get_tp_world_size() if model_parallel_is_initialized() else 1
 
-            self._tensor_dumper = DiffusionTensorDumper(
-                dump_dir=self.server_args.debug_tensor_dump_output_folder,
-                dump_layers=None,
-                tp_size=tp_size,
-                tp_rank=tp_rank,
-                pp_rank=0,
-            )
-            for module_name, module in self.pipeline.modules.items():
-                if isinstance(module, torch.nn.Module):
-                    self._tensor_dumper._add_hook_recursive(
-                        module, module_name, module_name, "layers"
-                    )
-                    module.register_forward_hook(
-                        self._tensor_dumper._dump_hook(module_name, True)
-                    )
-
-            # VAE uses .decode() instead of forward(), so forward hooks won't
-            # fire. Wrap .decode() to capture its input/output.
-            vae = self.pipeline.get_module("vae", None)
-            if vae is not None and hasattr(vae, "decode"):
-                dumper = self._tensor_dumper
-                _orig_decode = vae.decode
-
-                def _wrapped_decode(*args, **kwargs):
-                    result = _orig_decode(*args, **kwargs)
-                    if args:
-                        dumper.add_tensor("vae.decode.input", args[0])
-                    dumper.add_tensor("vae.decode.output", result)
-                    dumper.dump_current_tensors()
-                    return result
-
-                vae.decode = _wrapped_decode
+            try:
+                self._tensor_dumper = DiffusionTensorDumper(
+                    dump_dir=self.server_args.debug_tensor_dump_output_folder,
+                    rank=tp_rank,
+                    local_rank=self.local_rank,
+                )
+                self._tensor_dumper.register_pipeline(self.pipeline)
+            except Exception as e:
+                logger.error("Failed to register tensor dump hooks: %s", e)
+                self._tensor_dumper = None
 
         # apply layerwise offload after lora is applied while building LoRAPipeline
         # otherwise empty offloaded weights could fail lora converting
@@ -408,6 +443,9 @@ class GPUWorker:
                         trace_slice(item.trace_ctx, DiffStage.GPU_FORWARD)
                     )
                 result = forward_fn()
+
+            if getattr(self, "_tensor_dumper", None) is not None:
+                self._tensor_dumper.flush()
 
             # disagg roles return raw Req so callers can keep and transfer intermediate tensors
             # before converting it to OutputBatch
